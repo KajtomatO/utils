@@ -13,3 +13,4 @@ CURRENT_USER=$(who am i | awk '{print $1}')
 echo "$CURRENT_USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 echo "$CURRENT_USER has been added to the sudoers list."
+
