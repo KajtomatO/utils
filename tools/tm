@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# tm — tmux session helper. Requires bash and tmux; `tm claude` also requires jq.
+set -euo pipefail
+: "${HOME:?tm: HOME is not set}"
+
+TMUX_CONF="$HOME/.tmux.conf"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+
+die()  { printf 'tm: %s\n' "$*" >&2; exit 1; }
+info() { printf 'tm: %s\n' "$*" >&2; }
+require() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+# Session names in the order that defines tm's 1-based ids. That order is
+# whatever `tmux list-sessions` returns (it sorts by name); cmd_ls numbers the
+# same list, so listing and lookup cannot disagree about which session id 2 is.
+session_names() {
+  tmux list-sessions -F '#{session_name}' 2>/dev/null
+}
+
+cmd_ls() {
+  local fmt=$'#{session_name}\t#{session_windows}w\t#{?session_attached,attached,detached}\t#{t:session_created}'
+  local -a rows=()
+  mapfile -t rows < <(tmux list-sessions -F "$fmt" 2>/dev/null)
+  if [ ${#rows[@]} -eq 0 ]; then
+    echo "no tmux sessions (server not running)"
+    return 0
+  fi
+  {
+    printf 'ID\tNAME\tWINDOWS\tSTATUS\tCREATED\n'
+    local i=1 row
+    for row in "${rows[@]}"; do
+      printf '%d\t%s\n' "$i" "$row"
+      i=$((i + 1))
+    done
+  } | if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi
+}
+
+# Turn what the user typed into a tmux target spec.
+#   N     the ID column from `tm ls` (1-based), when N is in range
+#   $N    a raw tmux session id, passed through untouched
+#   =name an exact session name, passed through untouched
+#   name  an exact session name
+# Numeric-but-out-of-range falls through to a name match, so a session called
+# "12" is still reachable as `tm a 12` when there is no twelfth session.
+resolve_target() {
+  local target="$1"
+  case "$target" in
+    '$'[0-9]*) printf '%s\n' "$target"; return 0 ;;
+    '='*)      printf '%s\n' "$target"; return 0 ;;
+  esac
+  if [[ "$target" =~ ^[0-9]+$ ]]; then
+    local -a names=()
+    mapfile -t names < <(session_names)
+    local n=$((10#$target))
+    if [ "$n" -ge 1 ] && [ "$n" -le ${#names[@]} ]; then
+      printf '=%s\n' "${names[$((n - 1))]}"
+      return 0
+    fi
+  fi
+  printf '=%s\n' "$target"
+}
+
+# Echo the real name of the session a target resolves to, or fail if there is none.
+# Deliberately not `display-message -p`: with no client attached that prints an
+# empty name and still exits 0, which would look like a successful lookup.
+target_name() {
+  local spec
+  spec="$(resolve_target "$1")"
+  tmux has-session -t "$spec" 2>/dev/null || return 1
+  case "$spec" in
+    '='*) printf '%s\n' "${spec#=}"; return 0 ;;
+  esac
+  local id name
+  while IFS=$'\t' read -r id name; do
+    if [ "$id" = "$spec" ]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  done < <(tmux list-sessions -F $'#{session_id}\t#{session_name}' 2>/dev/null)
+  return 1
+}
+
+cmd_attach() {
+  [ $# -ge 1 ] || die "usage: tm a <id|name>   (run 'tm ls' to see sessions)"
+  local verb=attach-session
+  if [ -n "${TMUX:-}" ]; then
+    verb=switch-client
+  fi
+  tmux "$verb" -t "$(resolve_target "$1")" \
+    || die "could not attach to '$1' (see 'tm ls')"
+}
+
+cmd_new() {
+  local -a args=()
+  if [ $# -ge 1 ] && [ -n "${1:-}" ]; then
+    args=(-s "$1")
+  fi
+  if [ -n "${TMUX:-}" ]; then
+    # nesting an attach inside tmux is refused: create detached, then switch this client
+    local created
+    if ! created="$(tmux new-session -d -P -F '#{session_name}' "${args[@]}")"; then
+      die "could not create session"
+    fi
+    tmux switch-client -t "=$created"
+  else
+    tmux new-session "${args[@]}"
+  fi
+}
+
+cmd_kill() {
+  [ $# -ge 1 ] || die "usage: tm kill <id|name> [id|name ...]   (run 'tm ls' to see sessions)"
+  # Resolve every target before killing anything: ids are positions in `tm ls`,
+  # so killing id 1 first would make `tm kill 1 2` delete the wrong second session.
+  local -a names=()
+  local target name rc=0
+  for target in "$@"; do
+    if ! name="$(target_name "$target")"; then
+      info "no such session: $target"
+      rc=1
+      continue
+    fi
+    local seen=0 known
+    for known in ${names[@]+"${names[@]}"}; do
+      if [ "$known" = "$name" ]; then
+        seen=1
+      fi
+    done
+    if [ "$seen" -eq 0 ]; then
+      names+=("$name")
+    fi
+  done
+  for name in ${names[@]+"${names[@]}"}; do
+    if tmux kill-session -t "=$name" 2>/dev/null; then
+      info "killed session: $name"
+    else
+      info "could not kill session: $name"
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+cmd_kill_all() {
+  local yes=0
+  case "${1:-}" in
+    -y|--yes|-f|--force) yes=1 ;;
+    '') ;;
+    *) die "usage: tm kill-all [-y]" ;;
+  esac
+  local -a names=()
+  mapfile -t names < <(session_names)
+  if [ ${#names[@]} -eq 0 ]; then
+    info "no tmux sessions to kill"
+    return 0
+  fi
+  if [ "$yes" -eq 0 ]; then
+    [ -t 0 ] || die "refusing to kill ${#names[@]} session(s) without a terminal to confirm on; re-run with -y"
+    info "about to kill ${#names[@]} session(s): ${names[*]}"
+    local reply=""
+    read -r -p "tm: this stops the tmux server. continue? [y/N] " reply || true
+    case "$reply" in
+      y|Y|yes|YES) ;;
+      *) info "aborted"; return 1 ;;
+    esac
+  fi
+  # Say it first — inside tmux the server dies with this pane and later output is lost.
+  info "killing ${#names[@]} session(s) and stopping the tmux server"
+  tmux kill-server 2>/dev/null || true
+}
+
+ensure_tmux_conf() {
+  local ts="$1"
+  local -a want=(
+    "set -s extended-keys on"
+    "set -as terminal-features 'xterm*:extkeys'"
+    "set -g allow-passthrough on"
+    "set -g mouse on"
+  )
+  local -a missing=()
+  local line
+  for line in "${want[@]}"; do
+    if [ ! -f "$TMUX_CONF" ] || ! grep -qxF -- "$line" "$TMUX_CONF"; then
+      missing+=("$line")
+    fi
+  done
+  if [ ${#missing[@]} -eq 0 ]; then
+    info "~/.tmux.conf: already configured"
+    return 0
+  fi
+  if [ -f "$TMUX_CONF" ]; then
+    cp -p -- "$TMUX_CONF" "$TMUX_CONF.bak.$ts"
+    info "backed up ~/.tmux.conf -> ~/.tmux.conf.bak.$ts"
+  fi
+  {
+    printf '\n# --- Claude Code settings (added by tm claude, %s) ---\n' "$(date +%F)"
+    printf '%s\n' "${missing[@]}"
+  } >>"$TMUX_CONF"
+  info "~/.tmux.conf: added ${#missing[@]} line(s):"
+  for line in "${missing[@]}"; do
+    info "  + $line"
+  done
+}
+
+ensure_claude_settings() {
+  local ts="$1"
+  mkdir -p "${CLAUDE_SETTINGS%/*}"
+  local input='{}'
+  if [ -s "$CLAUDE_SETTINGS" ]; then
+    jq -e . "$CLAUDE_SETTINGS" >/dev/null 2>&1 \
+      || die "$CLAUDE_SETTINGS is not valid JSON; refusing to touch it (fix or delete it, then re-run)"
+    input="$(cat "$CLAUDE_SETTINGS")"
+  fi
+  if jq -e '.env.CLAUDE_CODE_TMUX_TRUECOLOR == "1" and .env.CLAUDE_CODE_NO_FLICKER == "1"' \
+       <<<"$input" >/dev/null; then
+    info "settings.json: already configured"
+    return 0
+  fi
+  if [ -s "$CLAUDE_SETTINGS" ]; then
+    cp -p -- "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak.$ts"
+    info "backed up settings.json -> $CLAUDE_SETTINGS.bak.$ts"
+  fi
+  local tmp
+  tmp="$(mktemp "${CLAUDE_SETTINGS%/*}/.settings.json.tmp.XXXXXX")"
+  jq '.env = ((.env // {}) + {"CLAUDE_CODE_TMUX_TRUECOLOR":"1","CLAUDE_CODE_NO_FLICKER":"1"})' \
+     <<<"$input" >"$tmp" || { rm -f "$tmp"; die "jq merge failed"; }
+  jq -e . "$tmp" >/dev/null || { rm -f "$tmp"; die "merge produced invalid JSON; original left untouched"; }
+  if [ -f "$CLAUDE_SETTINGS" ]; then
+    chmod --reference="$CLAUDE_SETTINGS" "$tmp" 2>/dev/null || true
+  fi
+  mv -- "$tmp" "$CLAUDE_SETTINGS"
+  info "settings.json: set env.CLAUDE_CODE_TMUX_TRUECOLOR=1 and env.CLAUDE_CODE_NO_FLICKER=1 (other keys preserved)"
+}
+
+reload_tmux() {
+  if tmux list-sessions >/dev/null 2>&1; then
+    if tmux source-file "$TMUX_CONF" 2>/dev/null; then
+      info "reloaded ~/.tmux.conf in the running tmux server"
+    else
+      info "warning: tmux server is running but 'source-file' reported an error; check ~/.tmux.conf"
+    fi
+  else
+    info "tmux server not running; config applies on next tmux start"
+  fi
+  info "restart Claude Code sessions to pick up the new env vars"
+}
+
+cmd_claude() {
+  require jq
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  ensure_tmux_conf "$ts"
+  ensure_claude_settings "$ts"
+  reload_tmux
+}
+
+cmd_help() {
+  cat <<'EOF'
+tm — tmux session helper
+
+Usage:
+  tm                 List active tmux sessions (default)
+  tm ls              List active tmux sessions with IDs
+  tm a <id|name>     Attach to a session by id or exact name.
+                     Inside tmux, switches the current client instead.
+  tm new [name]      Create a new session (named or auto-named).
+                     Inside tmux, creates it detached and switches to it.
+  tm kill <id|name>… Close one or more sessions. All ids are resolved before
+                     anything is killed, so a list of ids stays correct.
+  tm kill-all [-y]   Close every session and stop the tmux server.
+                     Asks for confirmation unless given -y.
+  tm claude          Configure tmux + Claude Code to work well together:
+                       ~/.tmux.conf            extended-keys, allow-passthrough,
+                                               mouse
+                       ~/.claude/settings.json CLAUDE_CODE_TMUX_TRUECOLOR=1,
+                                               CLAUDE_CODE_NO_FLICKER=1
+                     Idempotent; backs up files before changing them.
+  tm help            Show this help
+
+Session ids are the ID column of `tm ls`, numbered from 1. They are positions
+in that list, not tmux's own ids, so they change as sessions come and go — run
+`tm ls` before acting on one. To be explicit: $3 is a raw tmux session id, and
+=name forces an exact name match.
+EOF
+}
+
+main() {
+  local sub="ls"
+  if [ $# -gt 0 ]; then
+    sub="$1"
+    shift
+  fi
+  case "$sub" in
+    ls)             require tmux; cmd_ls "$@" ;;
+    a|attach)       require tmux; cmd_attach "$@" ;;
+    new)            require tmux; cmd_new "$@" ;;
+    k|kill|close)   require tmux; cmd_kill "$@" ;;
+    ka|kill-all|killall)
+                    require tmux; cmd_kill_all "$@" ;;
+    claude)         cmd_claude "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)              cmd_help >&2; die "unknown subcommand: $sub" ;;
+  esac
+}
+main "$@"

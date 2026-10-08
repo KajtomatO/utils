@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+# gls — git status overview for a folder of repos. Requires bash 4.4+ and git.
+set -euo pipefail
+
+FETCH_JOBS=8       # fetches running at once
+FETCH_TIMEOUT=30   # seconds per repo, when `timeout` is available
+NCOL=7             # NAME BRANCH DIRTY STAGED UNTRACKED PUSHED AHEAD
+
+# Reading status never needs the index lock; don't contend for it with an
+# editor or agent that is working in the same repo.
+export GIT_OPTIONAL_LOCKS=0
+
+OPT_LONG=0
+OPT_RECURSIVE=0
+OPT_FETCH=1
+OPT_ALL=0
+ROOT="."
+
+# One entry per reported folder.
+PATHS=()
+NAMES=()
+ISREPO=()
+
+# The report, NCOL cells per row; CKEYS holds each cell's color name ("" for
+# none), and a row's first key is the color of the whole repo. Row r describes
+# folder r of the arrays above.
+CELLS=()
+CKEYS=()
+
+FETCH_RUNNER=()
+FETCH_PIDS=()
+FETCH_FAILED=()   # sparse: set at the index of each folder whose fetch failed
+
+die()  { printf 'gls: %s\n' "$*" >&2; exit 1; }
+info() { printf 'gls: %s\n' "$*" >&2; }
+require() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+# True only for the root of a work tree. The .git test comes first so walking a
+# big tree costs no forks, and --show-cdup rules out a folder whose .git is
+# junk but which sits inside some outer repo that git would happily report on.
+is_repo() {
+  local cdup
+  [ -e "$1/.git" ] || return 1
+  cdup="$(git -C "$1" rev-parse --show-cdup 2>/dev/null)" || return 1
+  [ -z "$cdup" ]
+}
+
+add_dir() {
+  PATHS+=("$1")
+  NAMES+=("$2")
+  ISREPO+=("$3")
+}
+
+# Record the folders under $1 ($2 is the prefix their names are shown with).
+# Flat mode lists every folder. Recursive mode lists repos only: it descends
+# into plain folders and stops at each repo root, and it stays out of symlinks
+# (loops) and node_modules (huge, and never where a repo of yours lives).
+collect() {
+  local dir="$1" prefix="$2" entry name
+  for entry in "$dir"/*/; do
+    entry="${entry%/}"
+    name="${entry##*/}"
+    if is_repo "$entry"; then
+      add_dir "$entry" "$prefix$name" 1
+    elif [ "$OPT_RECURSIVE" -eq 0 ]; then
+      add_dir "$entry" "$prefix$name" 0
+    elif [ ! -L "$entry" ] && [ "$name" != node_modules ]; then
+      collect "$entry" "$prefix$name/"
+    fi
+  done
+}
+
+# Runs in a background subshell and execs, so the pid the parent holds is the
+# fetch itself and can be signalled. Nothing here may prompt: with several
+# fetches sharing one terminal, a passphrase or host-key question could not be
+# answered sanely, so such a fetch fails instead and is reported.
+fetch_one() {
+  local dir="$1" ssh_cmd
+  ssh_cmd="${GIT_SSH_COMMAND:-$(git -C "$dir" config --get core.sshCommand || echo ssh)}"
+  export GIT_SSH_COMMAND="$ssh_cmd -o BatchMode=yes -o ConnectTimeout=10"
+  export GIT_TERMINAL_PROMPT=0
+  exec ${FETCH_RUNNER[@]+"${FETCH_RUNNER[@]}"} git -C "$dir" fetch --all --quiet \
+    </dev/null >/dev/null 2>&1
+}
+
+on_interrupt() {
+  if [ ${#FETCH_PIDS[@]} -gt 0 ]; then
+    kill "${FETCH_PIDS[@]}" 2>/dev/null || true
+  fi
+  if [ -t 2 ]; then printf '\r\033[K' >&2; fi
+  exit 130
+}
+
+# Fetch every repo, FETCH_JOBS at a time. Batches rather than a sliding window:
+# `wait <pid>` is the portable way to learn which fetch failed.
+fetch_repos() {
+  local -a todo=() bidx=() bpid=()
+  local i j k
+  for i in "${!PATHS[@]}"; do
+    if [ "${ISREPO[$i]}" -eq 1 ]; then todo+=("$i"); fi
+  done
+  if [ ${#todo[@]} -eq 0 ]; then return 0; fi
+  if command -v timeout >/dev/null 2>&1; then
+    FETCH_RUNNER=(timeout "$FETCH_TIMEOUT")
+  fi
+  trap on_interrupt INT TERM
+  if [ -t 2 ]; then printf 'gls: fetching %d repo(s)…' "${#todo[@]}" >&2; fi
+  for k in "${!todo[@]}"; do
+    i="${todo[$k]}"
+    fetch_one "${PATHS[$i]}" &
+    FETCH_PIDS+=("$!")
+    bidx+=("$i")
+    bpid+=("$!")
+    if [ ${#bpid[@]} -ge "$FETCH_JOBS" ] || [ "$k" -eq $((${#todo[@]} - 1)) ]; then
+      for j in "${!bpid[@]}"; do
+        if ! wait "${bpid[$j]}"; then
+          FETCH_FAILED[${bidx[$j]}]=1
+        fi
+      done
+      bidx=()
+      bpid=()
+    fi
+  done
+  if [ -t 2 ]; then printf '\r\033[K' >&2; fi
+  trap - INT TERM
+}
+
+# add_row <repo color> <name> <branch> <dirty> <staged> <untracked> <pushed>
+#         <ahead> [dirty color] [staged color] [pushed color] [ahead color]
+add_row() {
+  CELLS+=("$2" "$3" "$4" "$5" "$6" "$7" "$8")
+  CKEYS+=("$1" "" "${9:-}" "${10:-}" "" "${11:-}" "${12:-}")
+}
+
+# inspect_repo <dir> <name> <fetch failed: 0|1>
+inspect_repo() {
+  local dir="$1" name="$2" stale="$3" status
+  if ! status="$(git -C "$dir" status --porcelain=v2 --branch --untracked-files=normal 2>/dev/null)"; then
+    add_row red "$name" "?" "?" "?" "?" "?" "?"
+    return 0
+  fi
+
+  local oid="" head="" upstream="" ab="" line xy
+  local dirty=0 staged=0 untracked=0
+  while IFS= read -r line; do
+    case "$line" in
+      '# branch.oid '*)      oid="${line#* * }" ;;
+      '# branch.head '*)     head="${line#* * }" ;;
+      '# branch.upstream '*) upstream="${line#* * }" ;;
+      '# branch.ab '*)       ab="${line#* * }" ;;
+      [12]' '*)
+        # XY: X is the index, Y the work tree; "." means unchanged
+        xy="${line:2:2}"
+        if [ "${xy:0:1}" != . ]; then staged=$((staged + 1)); fi
+        if [ "${xy:1:1}" != . ]; then dirty=$((dirty + 1)); fi
+        ;;
+      'u '*) dirty=$((dirty + 1)) ;;
+      '? '*) untracked=$((untracked + 1)) ;;
+    esac
+  done <<<"$status"
+
+  local unborn=0 ahead=0 behind=0
+  if [ "$oid" = "(initial)" ]; then unborn=1; fi
+  if [ -n "$ab" ]; then
+    ahead="${ab%% *}"
+    ahead="${ahead#+}"
+    behind="${ab##* -}"
+  fi
+
+  # Every branch that contains HEAD. One whose tip is not HEAD itself has
+  # commits on top of it; any remote one at all means HEAD exists on a remote.
+  local on_remote=0 local_ahead=0 remote_ahead=0 r_oid r_name r_sym
+  if [ "$unborn" -eq 0 ]; then
+    while read -r r_oid r_name r_sym; do
+      case "$r_name" in
+        refs/heads/*)
+          if [ "$r_oid" != "$oid" ]; then local_ahead=$((local_ahead + 1)); fi
+          ;;
+        refs/remotes/*)
+          on_remote=1
+          # the upstream is judged by "behind"; origin/HEAD only aliases a branch
+          if [ "$r_oid" != "$oid" ] && [ -z "$r_sym" ] \
+             && [ "$r_name" != "refs/remotes/$upstream" ]; then
+            remote_ahead=$((remote_ahead + 1))
+          fi
+          ;;
+      esac
+    done < <(git -C "$dir" for-each-ref --contains HEAD \
+               --format='%(objectname) %(refname) %(symref)' refs/heads refs/remotes 2>/dev/null)
+  fi
+
+  local branch="$head"
+  if [ "$head" = "(detached)" ]; then branch="(detached ${oid:0:7})"; fi
+
+  local c_dirty=no k_dirty="" c_staged=no k_staged=""
+  if [ "$dirty" -gt 0 ]; then c_dirty=YES; k_dirty=red; fi
+  if [ "$staged" -gt 0 ]; then c_staged=YES; k_staged=red; fi
+
+  local c_pushed k_pushed=""
+  if [ "$unborn" -eq 1 ]; then
+    c_pushed="-"
+  elif [ -n "$ab" ]; then
+    if [ "$ahead" -eq 0 ]; then c_pushed=yes; else c_pushed="NO +$ahead"; k_pushed=red; fi
+  elif [ -n "$upstream" ]; then
+    # an upstream is configured but its branch no longer exists on the remote
+    c_pushed="NO gone"; k_pushed=red
+  elif [ "$on_remote" -eq 1 ]; then
+    c_pushed=yes
+  else
+    c_pushed=NO; k_pushed=red
+  fi
+
+  local c_ahead="" k_ahead=""
+  if [ "$behind" -gt 0 ]; then
+    c_ahead="upstream -$behind"; k_ahead=red
+  fi
+  if [ "$local_ahead" -gt 0 ]; then
+    c_ahead="${c_ahead:+$c_ahead, }local $local_ahead"; k_ahead=red
+  fi
+  if [ "$remote_ahead" -gt 0 ]; then
+    c_ahead="${c_ahead:+$c_ahead, }remote $remote_ahead"; k_ahead="${k_ahead:-yellow}"
+  fi
+  if [ -z "$c_ahead" ]; then
+    if [ "$unborn" -eq 1 ]; then c_ahead="-"; else c_ahead=no; fi
+  fi
+
+  # a failed fetch is red by itself: the other checks ran against stale data
+  local key=green
+  if [ -n "$k_dirty$k_staged$k_pushed" ] || [ "$k_ahead" = red ] || [ "$stale" -eq 1 ]; then
+    key=red
+  elif [ "$k_ahead" = yellow ]; then
+    key=yellow
+  fi
+
+  local label="$name"
+  if [ "$dirty" -gt 0 ] || [ "$staged" -gt 0 ]; then label+="*"; fi
+  if [ "$untracked" -gt 0 ]; then label+="+"; fi
+
+  add_row "$key" "$label" "$branch" "$c_dirty" "$c_staged" "$untracked" "$c_pushed" "$c_ahead" \
+    "$k_dirty" "$k_staged" "$k_pushed" "$k_ahead"
+}
+
+C_RED="" C_GREEN="" C_YELLOW="" C_GRAY="" C_RESET="" C_STRIKE="" C_NOSTRIKE=""
+setup_colors() {
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_GRAY=$'\033[90m'
+    C_RESET=$'\033[0m'
+    C_STRIKE=$'\033[9m'
+    C_NOSTRIKE=$'\033[29m'
+  fi
+}
+
+# paint <color name> <text> — callers pad afterwards, from the plain text's
+# length, so escape codes never throw the columns off.
+paint() {
+  local code=""
+  case "$1" in
+    red)    code="$C_RED" ;;
+    green)  code="$C_GREEN" ;;
+    yellow) code="$C_YELLOW" ;;
+    gray)   code="$C_GRAY" ;;
+  esac
+  if [ -n "$code" ]; then
+    printf '%s%s%s' "$code" "$2" "$C_RESET"
+  else
+    printf '%s' "$2"
+  fi
+}
+
+# paint_name <row> — the NAME cell. A repo whose fetch failed has its name
+# struck through; only the folder name, so a * or + after it stays readable.
+paint_name() {
+  local r="$1" text n
+  text="${CELLS[r * NCOL]}"
+  if [ -n "$C_STRIKE" ] && [ -n "${FETCH_FAILED[r]:-}" ]; then
+    n=${#NAMES[r]}
+    printf '%s%s%s%s%s%s' "$C_RED" "$C_STRIKE" "${text:0:n}" "$C_NOSTRIKE" "${text:n}" "$C_RESET"
+  else
+    paint "${CKEYS[r * NCOL]}" "$text"
+  fi
+}
+
+render_simple() {
+  local rows=$((${#CELLS[@]} / NCOL)) r w=0 name key
+  # folders that are not repos print no branch, so they don't widen the column
+  for ((r = 0; r < rows; r++)); do
+    name="${CELLS[r * NCOL]}"
+    if [ "${CKEYS[r * NCOL]}" != gray ] && [ ${#name} -gt "$w" ]; then w=${#name}; fi
+  done
+  for ((r = 0; r < rows; r++)); do
+    name="${CELLS[r * NCOL]}"
+    key="${CKEYS[r * NCOL]}"
+    paint_name "$r"
+    if [ "$key" != gray ]; then
+      printf '%*s  %s' $((w - ${#name})) '' "${CELLS[r * NCOL + 1]}"
+    fi
+    printf '\n'
+  done
+}
+
+render_long() {
+  local -a heads=(NAME BRANCH DIRTY STAGED UNTRACKED PUSHED AHEAD) widths=()
+  local rows=$((${#CELLS[@]} / NCOL)) r c cell
+  for ((c = 0; c < NCOL; c++)); do
+    widths[c]=${#heads[c]}
+    for ((r = 0; r < rows; r++)); do
+      cell="${CELLS[r * NCOL + c]}"
+      if [ ${#cell} -gt "${widths[c]}" ]; then widths[c]=${#cell}; fi
+    done
+  done
+  # row -1 is the header
+  for ((r = -1; r < rows; r++)); do
+    for ((c = 0; c < NCOL; c++)); do
+      if [ "$r" -lt 0 ]; then
+        cell="${heads[c]}"
+        paint "" "$cell"
+      elif [ "$c" -eq 0 ]; then
+        cell="${CELLS[r * NCOL]}"
+        paint_name "$r"
+      else
+        cell="${CELLS[r * NCOL + c]}"
+        paint "${CKEYS[r * NCOL + c]}" "$cell"
+      fi
+      if [ "$c" -lt $((NCOL - 1)) ]; then
+        printf '%*s' $((widths[c] - ${#cell} + 2)) ''
+      fi
+    done
+    printf '\n'
+  done
+}
+
+cmd_help() {
+  cat <<'EOF'
+gls — git status overview for a folder of repos
+
+Usage:
+  gls [options] [path]   Report on every folder directly under path
+                         (default: the current directory)
+
+Options:
+  -l, --long        One column per check, to see why a name has its color
+  -r, --recursive   Find repos at any depth. Lists repos only, by relative
+                    path; does not look inside a repo, node_modules or symlinks
+  -n, --no-fetch    Don't contact the remotes; judge from the last fetch
+  -a, --all         Include hidden (dot) folders
+  -h, --help        Show this help
+
+The short list prints each folder name and, for a repo, its current branch.
+The name's color is the verdict:
+  green    nothing to do
+  yellow   a remote branch other than the upstream has commits on top of the
+           current commit
+  red      any of: uncommitted changes, staged changes, branch not pushed,
+           branch behind its upstream, a local branch has commits on top of
+           the current commit, fetch failed
+  gray     not a git repo
+and its suffix:
+  *        uncommitted or staged changes
+  +        untracked files (these never change the color)
+A name that is red and struck through is a repo whose fetch failed.
+
+Columns of -l:
+  DIRTY      tracked files modified, deleted or in conflict
+  STAGED     changes in the index
+  UNTRACKED  untracked entries, counted as `git status` lists them
+  PUSHED     yes, "NO +N" (N commits not on the upstream), "NO gone" (the
+             upstream branch was deleted), or NO (no upstream, and the commit
+             is on no remote branch). A branch with no upstream still counts
+             as pushed when its commit already exists on a remote branch.
+  AHEAD      no, "upstream -N" (N commits to pull), "local N" / "remote N"
+             (N branches with commits on top of the current commit)
+
+Unless -n is given, gls first runs `git fetch --all` in every repo, in
+parallel and without prompting. A repo whose fetch fails is red, struck through
+and named on stderr; its other checks show the last-fetched state. Colors and
+strikethrough are used only when stdout is a terminal and NO_COLOR is unset.
+EOF
+}
+
+parse_args() {
+  local arg i
+  local -a paths=()
+  while [ $# -gt 0 ]; do
+    arg="$1"
+    shift
+    case "$arg" in
+      --long)      OPT_LONG=1 ;;
+      --recursive) OPT_RECURSIVE=1 ;;
+      --no-fetch)  OPT_FETCH=0 ;;
+      --all)       OPT_ALL=1 ;;
+      --help)      cmd_help; exit 0 ;;
+      --)          paths+=("$@"); break ;;
+      --*)         die "unknown option: $arg (see 'gls -h')" ;;
+      -?*)
+        for ((i = 1; i < ${#arg}; i++)); do
+          case "${arg:i:1}" in
+            l) OPT_LONG=1 ;;
+            r) OPT_RECURSIVE=1 ;;
+            n) OPT_FETCH=0 ;;
+            a) OPT_ALL=1 ;;
+            h) cmd_help; exit 0 ;;
+            *) die "unknown option: -${arg:i:1} (see 'gls -h')" ;;
+          esac
+        done
+        ;;
+      *) paths+=("$arg") ;;
+    esac
+  done
+  if [ ${#paths[@]} -gt 1 ]; then die "usage: gls [options] [path]"; fi
+  if [ ${#paths[@]} -eq 1 ]; then ROOT="${paths[0]}"; fi
+}
+
+main() {
+  parse_args "$@"
+  require git
+  [ -d "$ROOT" ] || die "not a directory: $ROOT"
+
+  shopt -s nullglob
+  if [ "$OPT_ALL" -eq 1 ]; then shopt -s dotglob; fi
+  collect "$ROOT" ""
+  if [ ${#PATHS[@]} -eq 0 ]; then
+    if [ "$OPT_RECURSIVE" -eq 1 ]; then
+      info "no git repos under $ROOT"
+    else
+      info "no folders under $ROOT"
+    fi
+    return 0
+  fi
+
+  if [ "$OPT_FETCH" -eq 1 ]; then fetch_repos; fi
+
+  local i
+  for i in "${!PATHS[@]}"; do
+    if [ "${ISREPO[$i]}" -eq 1 ]; then
+      inspect_repo "${PATHS[$i]}" "${NAMES[$i]}" "${FETCH_FAILED[$i]:-0}"
+    else
+      add_row gray "${NAMES[$i]}" "-" "-" "-" "-" "-" "-"
+    fi
+  done
+
+  setup_colors
+  if [ "$OPT_LONG" -eq 1 ]; then render_long; else render_simple; fi
+
+  if [ ${#FETCH_FAILED[@]} -gt 0 ]; then
+    local list=""
+    for i in "${!FETCH_FAILED[@]}"; do list+="${NAMES[$i]}, "; done
+    info "fetch failed, showing last-fetched state: ${list%, }"
+  fi
+}
+main "$@"
